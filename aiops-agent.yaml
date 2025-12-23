@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AIOps Agent - CloudTrail monitoring and EC2 management with Bedrock Agent'
+
+Parameters:
+  AgentName:
+    Type: String
+    Default: AIOpsAgent
+    Description: Name of the Bedrock Agent
+    
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Description: Bedrock Foundation Model ID
+    AllowedValues:
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-sonnet-4-20250514-v1:0
+
+Resources:
+  # ============================================================================
+  # CloudTrail Query Lambda Function
+  # ============================================================================
+  
+  CloudTrailLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentName}-CloudTrailLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudTrailReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                  - cloudtrail:GetEventSelectors
+                  - cloudtrail:ListTrails
+                Resource: '*'
+
+  CloudTrailLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AgentName}-cloudtrail-query'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CloudTrailLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import hashlib
+          from datetime import datetime, timedelta
+          
+          cloudtrail = boto3.client('cloudtrail')
+          query_cache = {}
+          CACHE_TTL_SECONDS = 60
+          
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              try:
+                  action_group = event.get('actionGroup', '')
+                  api_path = event.get('apiPath', '')
+                  parameters = event.get('parameters', [])
+                  params_dict = {p.get('name', ''): p.get('value', '') for p in parameters}
+                  
+                  cache_key = generate_cache_key(api_path, params_dict)
+                  cached = get_from_cache(cache_key)
+                  
+                  if cached:
+                      result = cached['data']
+                  else:
+                      if api_path == '/events/lookup':
+                          result = lookup_events(params_dict)
+                      elif api_path == '/events/by-user':
+                          result = get_events_by_user(params_dict)
+                      elif api_path == '/events/by-service':
+                          result = get_events_by_service(params_dict)
+                      elif api_path == '/events/recent':
+                          result = get_recent_events(params_dict)
+                      else:
+                          result = {'error': f'Unknown API path: {api_path}'}
+                      set_in_cache(cache_key, result)
+                  
+                  return {
+                      'messageVersion': '1.0',
+                      'response': {
+                          'actionGroup': action_group,
+                          'apiPath': api_path,
+                          'httpMethod': event.get('httpMethod', 'GET'),
+                          'httpStatusCode': 200,
+                          'responseBody': {
+                              'application/json': {
+                                  'body': json.dumps(result, default=str)
+                              }
+                          }
+                      }
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return create_error_response(event, str(e))
+          
+          def generate_cache_key(api_path, params):
+              return hashlib.md5(f"{api_path}:{json.dumps(params, sort_keys=True)}".encode()).hexdigest()
+          
+          def get_from_cache(key):
+              if key in query_cache:
+                  item = query_cache[key]
+                  age = (datetime.utcnow() - item['timestamp']).total_seconds()
+                  if age < CACHE_TTL_SECONDS:
+                      return {'data': item['data'], 'age': int(age)}
+                  del query_cache[key]
+              return None
+          
+          def set_in_cache(key, data):
+              query_cache[key] = {'data': data, 'timestamp': datetime.utcnow()}
+              if len(query_cache) > 10:
+                  oldest = min(query_cache.keys(), key=lambda k: query_cache[k]['timestamp'])
+                  del query_cache[oldest]
+          
+          def create_error_response(event, error):
+              return {
+                  'messageVersion': '1.0',
+                  'response': {
+                      'actionGroup': event.get('actionGroup', ''),
+                      'apiPath': event.get('apiPath', ''),
+                      'httpMethod': event.get('httpMethod', 'GET'),
+                      'httpStatusCode': 500,
+                      'responseBody': {
+                          'application/json': {
+                              'body': json.dumps({'error': error})
+                          }
+                      }
+                  }
+              }
+          
+          def lookup_events(params):
+              try:
+                  hours = min(int(params.get('hours', '24')), 168)
+                  max_results = min(int(params.get('max_results', '5')), 10)
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=hours)
+                  
+                  kwargs = {'StartTime': start_time, 'EndTime': end_time, 'MaxResults': max_results}
+                  lookup_attributes = []
+                  if params.get('event_name'):
+                      lookup_attributes.append({'AttributeKey': 'EventName', 'AttributeValue': params['event_name']})
+                  elif params.get('username'):
+                      lookup_attributes.append({'AttributeKey': 'Username', 'AttributeValue': params['username']})
+                  if lookup_attributes:
+                      kwargs['LookupAttributes'] = lookup_attributes[:1]
+                  
+                  response = cloudtrail.lookup_events(**kwargs)
+                  events = []
+                  for event in response.get('Events', [])[:max_results]:
+                      ct_event = json.loads(event.get('CloudTrailEvent', '{}'))
+                      events.append({
+                          'EventTime': event['EventTime'].isoformat(),
+                          'EventName': event['EventName'],
+                          'Username': event.get('Username', 'N/A'),
+                          'EventSource': event.get('EventSource', 'N/A'),
+                          'SourceIP': ct_event.get('sourceIPAddress', 'N/A')
+                      })
+                  
+                  return {
+                      'event_count': len(events),
+                      'time_range': {'start': start_time.isoformat(), 'end': end_time.isoformat()},
+                      'events': events
+                  }
+              except Exception as e:
+                  return {'error': str(e)}
+          
+          def get_events_by_user(params):
+              try:
+                  username = params.get('username')
+                  if not username:
+                      return {'error': 'username required'}
+                  hours = min(int(params.get('hours', '24')), 72)
+                  max_results = min(int(params.get('max_results', '5')), 10)
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=hours)
+                  
+                  response = cloudtrail.lookup_events(
+                      LookupAttributes=[{'AttributeKey': 'Username', 'AttributeValue': username}],
+                      StartTime=start_time, EndTime=end_time, MaxResults=max_results
+                  )
+                  events = [{'EventTime': e['EventTime'].isoformat(), 'EventName': e['EventName'], 
+                            'EventSource': e.get('EventSource', 'N/A')} 
+                           for e in response.get('Events', [])[:max_results]]
+                  return {'username': username, 'event_count': len(events), 'events': events}
+              except Exception as e:
+                  return {'error': str(e)}
+          
+          def get_events_by_service(params):
+              try:
+                  service = params.get('service')
+                  if not service:
+                      return {'error': 'service required'}
+                  if not service.endswith('.amazonaws.com'):
+                      service = f"{service}.amazonaws.com"
+                  hours = min(int(params.get('hours', '12')), 24)
+                  max_results = min(int(params.get('max_results', '5')), 10)
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=hours)
+                  
+                  response = cloudtrail.lookup_events(StartTime=start_time, EndTime=end_time, MaxResults=50)
+                  events = [{'EventTime': e['EventTime'].isoformat(), 'EventName': e['EventName'],
+                            'Username': e.get('Username', 'N/A')}
+                           for e in response.get('Events', []) if e.get('EventSource') == service][:max_results]
+                  return {'service': service, 'event_count': len(events), 'events': events}
+              except Exception as e:
+                  return {'error': str(e)}
+          
+          def get_recent_events(params):
+              try:
+                  hours = min(int(params.get('hours', '1')), 6)
+                  max_results = min(int(params.get('max_results', '5')), 10)
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=hours)
+                  
+                  response = cloudtrail.lookup_events(StartTime=start_time, EndTime=end_time, MaxResults=max_results)
+                  events = []
+                  for event in response.get('Events', [])[:max_results]:
+                      ct_event = json.loads(event.get('CloudTrailEvent', '{}'))
+                      events.append({
+                          'EventTime': event['EventTime'].isoformat(),
+                          'EventName': event['EventName'],
+                          'Username': event.get('Username', 'N/A'),
+                          'Service': event.get('EventSource', 'N/A').split('.')[0]
+                      })
+                  return {'event_count': len(events), 'time_range_hours': hours, 'events': events}
+              except Exception as e:
+                  return {'error': str(e)}
+
+  CloudTrailLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CloudTrailLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+
+  # ============================================================================
+  # EC2 Operations Lambda Function
+  # ============================================================================
+  
+  EC2LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentName}-EC2LambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2OperationsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:RebootInstances
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                Resource: '*'
+
+  EC2LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AgentName}-ec2-operations'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt EC2LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          
+          ec2 = boto3.client('ec2')
+          
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              try:
+                  action_group = event.get('actionGroup', '')
+                  api_path = event.get('apiPath', '')
+                  parameters = event.get('parameters', [])
+                  params_dict = {p.get('name', ''): p.get('value', '') for p in parameters}
+                  
+                  if api_path == '/instances/stop':
+                      result = stop_instance(params_dict)
+                  elif api_path == '/instances/start':
+                      result = start_instance(params_dict)
+                  elif api_path == '/instances/reboot':
+                      result = reboot_instance(params_dict)
+                  elif api_path == '/instances/status':
+                      result = get_instance_status(params_dict)
+                  elif api_path == '/instances/list':
+                      result = list_instances(params_dict)
+                  else:
+                      result = {'error': f'Unknown API path: {api_path}'}
+                  
+                  return {
+                      'messageVersion': '1.0',
+                      'response': {
+                          'actionGroup': action_group,
+                          'apiPath': api_path,
+                          'httpMethod': event.get('httpMethod', 'POST'),
+                          'httpStatusCode': 200,
+                          'responseBody': {
+                              'application/json': {
+                                  'body': json.dumps(result, default=str)
+                              }
+                          }
+                      }
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return create_error_response(event, str(e))
+          
+          def create_error_response(event, error):
+              return {
+                  'messageVersion': '1.0',
+                  'response': {
+                      'actionGroup': event.get('actionGroup', ''),
+                      'apiPath': event.get('apiPath', ''),
+                      'httpMethod': event.get('httpMethod', 'POST'),
+                      'httpStatusCode': 500,
+                      'responseBody': {
+                          'application/json': {
+                              'body': json.dumps({'error': error})
+                          }
+                      }
+                  }
+              }
+          
+          def get_instance_details(instance_id):
+              try:
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  if not response['Reservations']:
+                      return None
+                  instance = response['Reservations'][0]['Instances'][0]
+                  name = 'N/A'
+                  for tag in instance.get('Tags', []):
+                      if tag['Key'] == 'Name':
+                          name = tag['Value']
+                          break
+                  return {
+                      'instance_id': instance['InstanceId'],
+                      'name': name,
+                      'instance_type': instance['InstanceType'],
+                      'state': instance['State']['Name'],
+                      'private_ip': instance.get('PrivateIpAddress', 'N/A'),
+                      'public_ip': instance.get('PublicIpAddress', 'N/A')
+                  }
+              except:
+                  return None
+          
+          def stop_instance(params):
+              try:
+                  instance_id = params.get('instance_id')
+                  if not instance_id or not instance_id.startswith('i-'):
+                      return {'error': 'Valid instance_id required'}
+                  
+                  details = get_instance_details(instance_id)
+                  if not details:
+                      return {'error': f'Instance {instance_id} not found'}
+                  
+                  if details['state'] in ['stopped', 'stopping']:
+                      return {'success': True, 'message': f"Already {details['state']}", 
+                             'instance_id': instance_id, 'current_state': details['state']}
+                  
+                  response = ec2.stop_instances(InstanceIds=[instance_id])
+                  new_state = response['StoppingInstances'][0]['CurrentState']['Name']
+                  return {
+                      'success': True, 'message': 'Instance stop initiated',
+                      'instance_id': instance_id, 'current_state': new_state,
+                      'instance_details': details
+                  }
+              except Exception as e:
+                  return {'error': str(e), 'instance_id': params.get('instance_id')}
+          
+          def start_instance(params):
+              try:
+                  instance_id = params.get('instance_id')
+                  if not instance_id or not instance_id.startswith('i-'):
+                      return {'error': 'Valid instance_id required'}
+                  
+                  details = get_instance_details(instance_id)
+                  if not details:
+                      return {'error': f'Instance {instance_id} not found'}
+                  
+                  if details['state'] in ['running', 'pending']:
+                      return {'success': True, 'message': f"Already {details['state']}",
+                             'instance_id': instance_id, 'current_state': details['state']}
+                  
+                  response = ec2.start_instances(InstanceIds=[instance_id])
+                  new_state = response['StartingInstances'][0]['CurrentState']['Name']
+                  return {
+                      'success': True, 'message': 'Instance start initiated',
+                      'instance_id': instance_id, 'current_state': new_state,
+                      'instance_details': details
+                  }
+              except Exception as e:
+                  return {'error': str(e), 'instance_id': params.get('instance_id')}
+          
+          def reboot_instance(params):
+              try:
+                  instance_id = params.get('instance_id')
+                  if not instance_id or not instance_id.startswith('i-'):
+                      return {'error': 'Valid instance_id required'}
+                  
+                  details = get_instance_details(instance_id)
+                  if not details:
+                      return {'error': f'Instance {instance_id} not found'}
+                  
+                  if details['state'] != 'running':
+                      return {'error': f"Cannot reboot. State: {details['state']}"}
+                  
+                  ec2.reboot_instances(InstanceIds=[instance_id])
+                  return {
+                      'success': True, 'message': 'Instance reboot initiated',
+                      'instance_id': instance_id, 'instance_details': details
+                  }
+              except Exception as e:
+                  return {'error': str(e), 'instance_id': params.get('instance_id')}
+          
+          def get_instance_status(params):
+              try:
+                  instance_id = params.get('instance_id')
+                  if not instance_id or not instance_id.startswith('i-'):
+                      return {'error': 'Valid instance_id required'}
+                  
+                  details = get_instance_details(instance_id)
+                  if not details:
+                      return {'error': f'Instance {instance_id} not found'}
+                  
+                  return {'success': True, 'instance_id': instance_id, 'instance_details': details}
+              except Exception as e:
+                  return {'error': str(e), 'instance_id': params.get('instance_id')}
+          
+          def list_instances(params):
+              try:
+                  state_filter = params.get('state', 'all')
+                  max_results = min(int(params.get('max_results', '10')), 20)
+                  
+                  filters = []
+                  if state_filter != 'all':
+                      filters.append({'Name': 'instance-state-name', 'Values': [state_filter]})
+                  
+                  if filters:
+                      response = ec2.describe_instances(Filters=filters, MaxResults=max_results)
+                  else:
+                      response = ec2.describe_instances(MaxResults=max_results)
+                  
+                  instances = []
+                  for reservation in response['Reservations']:
+                      for instance in reservation['Instances']:
+                          name = 'N/A'
+                          for tag in instance.get('Tags', []):
+                              if tag['Key'] == 'Name':
+                                  name = tag['Value']
+                                  break
+                          instances.append({
+                              'instance_id': instance['InstanceId'],
+                              'name': name,
+                              'instance_type': instance['InstanceType'],
+                              'state': instance['State']['Name'],
+                              'private_ip': instance.get('PrivateIpAddress', 'N/A')
+                          })
+                  return {'success': True, 'instance_count': len(instances), 'instances': instances}
+              except Exception as e:
+                  return {'error': str(e)}
+
+  EC2LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EC2LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+
+  # ============================================================================
+  # Bedrock Agent IAM Role
+  # ============================================================================
+  
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentName}-BedrockAgentRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+      Policies:
+        - PolicyName: BedrockAgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CloudTrailLambdaFunction.Arn
+                  - !GetAtt EC2LambdaFunction.Arn
+
+Outputs:
+  CloudTrailLambdaArn:
+    Description: CloudTrail Query Lambda Function ARN
+    Value: !GetAtt CloudTrailLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AgentName}-CloudTrailLambdaArn'
+  
+  EC2LambdaArn:
+    Description: EC2 Operations Lambda Function ARN
+    Value: !GetAtt EC2LambdaFunction.Arn
+    Export:
+      Name: !Sub '${AgentName}-EC2LambdaArn'
+  
+  BedrockAgentRoleArn:
+    Description: Bedrock Agent IAM Role ARN
+    Value: !GetAtt BedrockAgentRole.Arn
+    Export:
+      Name: !Sub '${AgentName}-BedrockAgentRoleArn'
+  
+  NextSteps:
+    Description: Manual steps to complete setup
+    Value: !Sub |
+      1. Go to AWS Bedrock Console
+      2. Navigate to Agents → Create Agent
+      3. Use the following ARNs from this stack:
+         - Agent Role: ${BedrockAgentRole.Arn}
+         - CloudTrail Lambda: ${CloudTrailLambdaFunction.Arn}
+         - EC2 Lambda: ${EC2LambdaFunction.Arn}
+      4. Upload OpenAPI schemas (see deployment guide)
+      5. Add agent instructions (see deployment guide)
+      6. Click 'Prepare' and test!
