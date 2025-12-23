@@ -41,17 +41,8 @@ aws ec2 describe-instances --region us-east-1 --query 'Reservations[].Instances[
 
 ### ☑️ Enable Bedrock Model Access
 
-**If you haven't used Bedrock before:**
+**All Models are accessible bydefault now**
 
-1. Go to [AWS Bedrock Console](https://console.aws.amazon.com/bedrock)
-2. Click **"Model access"** in left sidebar
-3. Click **"Modify model access"**
-4. Check these models:
-   - ✅ Claude 3 Haiku
-   - ✅ Claude 3 Sonnet
-   - ✅ Claude Sonnet 4
-5. Click **"Request model access"**
-6. Wait for approval (usually instant ⚡)
 
 ---
 
